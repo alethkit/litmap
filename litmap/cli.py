@@ -247,6 +247,8 @@ def info_cmd(
     typer.echo(f"DOI:        {item.doi or '—'}")
     typer.echo(f"Zotero key: {item.key}")
     typer.echo(f"PDF:        {item.pdf_path or '—'}")
+    typer.echo(f"Snapshot:   {item.html_path or '—'}")
+    typer.echo(f"URL:        {item.url or '—'}")
 
     conn = sqlite3.connect(db_path)
 
@@ -256,11 +258,12 @@ def info_cmd(
     typer.echo(f"\nTitle+abstract embedded: {'yes, ' + row[0][:10] if row else 'no'}")
 
     row = conn.execute(
-        "SELECT n_tokens, n_chunks, embedded_at FROM fulltext_embeddings WHERE zotero_key = ?",
+        "SELECT n_tokens, n_chunks, embedded_at, source FROM fulltext_embeddings WHERE zotero_key = ?",
         (item.key,)
     ).fetchone()
     if row:
-        typer.echo(f"Full-text embedded:      yes, {row[2][:10]} ({row[0]} tokens, {row[1]} chunk{'s' if row[1] != 1 else ''})")
+        src = f", from {row[3]}" if row[3] else ""
+        typer.echo(f"Full-text embedded:      yes, {row[2][:10]} ({row[0]} tokens, {row[1]} chunk{'s' if row[1] != 1 else ''}{src})")
     else:
         typer.echo("Full-text embedded:      no")
 
@@ -274,7 +277,12 @@ def sync_cmd(
     zotero_db: Path = typer.Option(_DEFAULT_ZOTERO, hidden=True),
 ):
     """Sync Zotero items into embeddings DB. Use --force to regenerate all embeddings."""
-    from litmap.embedder import sync
+    from litmap.embedder import sync, prune_stale, init_db
+    from litmap.zotero import get_all_items
+    init_db(db_path)
+    pruned = prune_stale(db_path, {i.key for i in get_all_items(zotero_db)})
+    if pruned:
+        typer.echo(f"Removed {pruned} stale embeddings (deleted items or attachments).")
     count = sync(db_path, zotero_db, force=force)
     if count == 0:
         typer.echo("Already up to date.")
@@ -285,23 +293,32 @@ def sync_cmd(
 @app.command("sync-fulltext")
 def sync_fulltext_cmd(
     collection: Optional[str] = typer.Option(None, "--collection", "-c", help="Scope to a Zotero collection"),
-    force: bool = typer.Option(False, "--force", help="Re-embed even already-processed PDFs"),
+    force: bool = typer.Option(False, "--force", help="Re-embed even already-processed items"),
     max_tokens: int = typer.Option(3000, "--max-tokens", help="Max tokens per chunk (default 3000; up to 8000)"),
+    fetch_missing: bool = typer.Option(
+        False, "--fetch-missing",
+        help="For items with no local PDF or snapshot, fetch the GitHub README or web page at the item's URL (network).",
+    ),
     db_path: Path = typer.Option(_DEFAULT_DB, hidden=True),
     zotero_db: Path = typer.Option(_DEFAULT_ZOTERO, hidden=True),
 ):
-    """Embed full PDF text for Zotero items with a local PDF attachment.
+    """Embed full text for Zotero items with a local PDF or HTML snapshot.
 
     Vectors are stored in the fulltext_embeddings table and automatically
     preferred over title+abstract embeddings in search, map, and cluster.
-    Safe to interrupt and resume — already-embedded papers are skipped.
-    Use --collection to process only a subset of your library.
+    Safe to interrupt and resume — already-embedded items are skipped.
+    Use --collection to process only a subset of your library, and
+    --fetch-missing to also cover URL-only items (GitHub repos, web pages).
     """
     from litmap.embedder import sync_fulltext, init_db
     init_db(db_path)
-    n_embedded, n_no_pdf = sync_fulltext(db_path, zotero_db, force=force, max_tokens=max_tokens, collection=collection)
+    n_embedded, n_skipped = sync_fulltext(
+        db_path, zotero_db, force=force, max_tokens=max_tokens,
+        collection=collection, fetch_missing=fetch_missing,
+    )
     scope = f"collection '{collection}'" if collection else "full library"
-    typer.echo(f"Embedded {n_embedded} PDFs from {scope}. ({n_no_pdf} items had no local PDF and were skipped.)")
+    hint = "" if fetch_missing else " Pass --fetch-missing to also try URL-only items."
+    typer.echo(f"Embedded {n_embedded} items from {scope}. ({n_skipped} items had no usable full text and were skipped.){hint}")
 
 
 @app.command("cluster")

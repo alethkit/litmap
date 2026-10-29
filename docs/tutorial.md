@@ -395,3 +395,5 @@ litmap sync --force   # regenerate all embeddings
 - **The embedding model is local:** after first download, all commands work offline. No API keys, no rate limits.
 - **Zotero does not need to be running:** litmap reads `~/Zotero/zotero.sqlite` directly in read-only mode.
 - **Missing PDFs:** if `litmap info` shows `PDF: —` for a paper you expect to have a PDF, right-click the item in Zotero and choose Find Available PDF, then re-run `litmap sync-fulltext`.
+- **Web clips and GitHub repos:** items saved from the browser usually carry an HTML snapshot (`litmap info` shows it under `Snapshot:`), which `sync-fulltext` reads directly. Items with only a URL (e.g. `computerProgram` entries pointing at GitHub) are embedded from their README or page text when you pass `--fetch-missing`.
+- **Standalone PDFs:** a PDF dragged into Zotero without a parent item is an attachment, not a paper, and is skipped. Right-click it in Zotero and choose Create Parent Item.
