@@ -8,6 +8,10 @@ import numpy as np
 from tqdm import tqdm
 
 from litmap.zotero import get_all_items, Item, ZOTERO_DB
+from litmap.sources import (
+    text_for_item, has_local_fulltext, can_fetch,
+    extract_pdf_text as _extract_pdf_text,  # re-exported for backward compatibility
+)
 
 EMBEDDINGS_DB = Path.home() / "LitLake" / "embeddings.db"
 MODEL_NAME = "Alibaba-NLP/gte-modernbert-base"
@@ -19,11 +23,33 @@ _model = None
 _tokenizer = None
 
 
+def pick_device() -> str:
+    """Torch device for the embedding model.
+
+    Honour LITMAP_DEVICE if set (e.g. "cpu", "mps", "cuda"); otherwise use
+    Apple's MPS backend when it is actually available and fall back to CPU.
+    MPS can be missing inside sandboxes, containers and VMs even on a Mac.
+    """
+    import os
+    forced = os.environ.get("LITMAP_DEVICE", "").strip()
+    if forced:
+        return forced
+    try:
+        import torch
+        if torch.backends.mps.is_available():
+            return "mps"
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
 def _get_model():
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer(MODEL_NAME, device="mps")
+        _model = SentenceTransformer(MODEL_NAME, device=pick_device())
     return _model
 
 
@@ -58,6 +84,10 @@ def init_db(db_path: Path = EMBEDDINGS_DB) -> None:
     """)
     conn.execute("INSERT OR IGNORE INTO meta VALUES ('model', ?)", (MODEL_NAME,))
     conn.execute("INSERT OR IGNORE INTO meta VALUES ('dims', ?)", (str(DIMS),))
+    # Migration: databases created before HTML/URL sources lack the `source` column.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(fulltext_embeddings)").fetchall()}
+    if "source" not in cols:
+        conn.execute("ALTER TABLE fulltext_embeddings ADD COLUMN source TEXT")
     conn.commit()
     conn.close()
 
@@ -107,6 +137,7 @@ def sync(
 ) -> int:
     init_db(db_path)
     all_items = get_all_items(zotero_db)
+    prune_stale(db_path, {i.key for i in all_items})
     if force:
         items_to_embed = all_items
     else:
@@ -116,6 +147,39 @@ def sync(
         return 0
     _embed_and_store(items_to_embed, db_path)
     return len(items_to_embed)
+
+
+def prune_stale(db_path: Path, valid_keys: set[str]) -> int:
+    """Delete cached vectors whose Zotero key is no longer a paper.
+
+    Covers items that were deleted/trashed in Zotero and, after the item-type
+    fix, attachments that earlier versions wrongly embedded as papers.
+    Does nothing when valid_keys is empty (e.g. an unreadable Zotero DB), so a
+    transient failure can never wipe the cache. Returns the number of
+    rows removed from the embeddings table.
+    """
+    if not valid_keys:
+        return 0
+    conn = sqlite3.connect(db_path)
+    try:
+        removed = 0
+        for table in ("embeddings", "fulltext_embeddings"):
+            stale = [
+                r[0] for r in conn.execute(f"SELECT zotero_key FROM {table}").fetchall()
+                if r[0] not in valid_keys
+            ]
+            for start in range(0, len(stale), 500):
+                chunk = stale[start:start + 500]
+                conn.execute(
+                    f"DELETE FROM {table} WHERE zotero_key IN ({','.join('?' * len(chunk))})",
+                    chunk,
+                )
+            if table == "embeddings":
+                removed = len(stale)
+        conn.commit()
+    finally:
+        conn.close()
+    return removed
 
 
 def _existing_keys(db_path: Path) -> set[str]:
@@ -146,19 +210,8 @@ def _embed_and_store(items: list[Item], db_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Full-text PDF embedding
+# Full-text embedding (PDF, HTML snapshot, or fetched README / web page)
 # ---------------------------------------------------------------------------
-
-def _extract_pdf_text(pdf_path: Path) -> str:
-    """Extract plain text from a PDF using PyMuPDF. Returns empty string on failure."""
-    try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(str(pdf_path))
-        pages = [page.get_text() for page in doc]
-        doc.close()
-        return "\n".join(pages)
-    except Exception:
-        return ""
 
 
 def _truncate_to_tokens(text: str, max_tokens: int = _MAX_TOKENS) -> tuple[str, int]:
@@ -173,16 +226,20 @@ def _truncate_to_tokens(text: str, max_tokens: int = _MAX_TOKENS) -> tuple[str, 
     return truncated_text, max_tokens
 
 
-def _embed_fulltext_single(item: Item, max_tokens: int = _MAX_TOKENS) -> Optional[tuple[np.ndarray, int, int]]:
-    """Extract, chunk, embed and average a single paper's full text.
+def _embed_fulltext_single(
+    item: Item,
+    max_tokens: int = _MAX_TOKENS,
+    fetch_missing: bool = False,
+) -> Optional[tuple[np.ndarray, int, int, str]]:
+    """Extract, chunk, embed and average a single item's full text.
 
+    Text comes from the item's PDF, else its HTML snapshot, else (only when
+    fetch_missing=True) a GitHub README or the page at its URL.
     Strategy: split into non-overlapping chunks of max_tokens tokens,
     embed each chunk, then return the L2-normalised mean vector.
-    Returns (vector, n_tokens, n_chunks) or None if no text extracted.
+    Returns (vector, n_tokens, n_chunks, source) or None if no text extracted.
     """
-    if item.pdf_path is None:
-        return None
-    raw_text = _extract_pdf_text(item.pdf_path)
+    raw_text, source = text_for_item(item, fetch_missing=fetch_missing)
     if not raw_text.strip():
         return None
 
@@ -216,7 +273,7 @@ def _embed_fulltext_single(item: Item, max_tokens: int = _MAX_TOKENS) -> Optiona
     if norm > 0:
         mean_vec = mean_vec / norm
 
-    return mean_vec, n_tokens, n_chunks
+    return mean_vec, n_tokens, n_chunks, source
 
 
 def _existing_fulltext_keys(db_path: Path) -> set[str]:
@@ -268,12 +325,19 @@ def sync_fulltext(
     force: bool = False,
     max_tokens: int = _MAX_TOKENS,
     collection: Optional[str] = None,
+    fetch_missing: bool = False,
 ) -> tuple[int, int]:
-    """Embed full PDF text for Zotero items that have a local PDF.
+    """Embed full text for Zotero items.
+
+    Candidates are items with a local PDF or HTML snapshot. With
+    fetch_missing=True, items that have only a URL are also candidates: a
+    github.com repository URL yields its README, any other URL yields the
+    visible text of the page. Local files are never bypassed by a fetch.
 
     If collection is given, only items in that collection are processed.
     Skips items already in fulltext_embeddings unless force=True.
-    Returns (n_embedded, n_skipped_no_pdf).
+    Returns (n_embedded, n_skipped), where n_skipped counts items with no
+    usable text source (or whose source yielded no text).
     """
     init_db(db_path)
     if collection:
@@ -281,35 +345,41 @@ def sync_fulltext(
         all_items = get_collection(collection, zotero_db)
     else:
         all_items = get_all_items(zotero_db)
-    items_with_pdf = [i for i in all_items if i.pdf_path is not None]
-    n_skipped_no_pdf = len(all_items) - len(items_with_pdf)
+    candidates = [
+        i for i in all_items
+        if has_local_fulltext(i) or (fetch_missing and can_fetch(i))
+    ]
+    n_skipped = len(all_items) - len(candidates)
 
     if not force:
         existing = _existing_fulltext_keys(db_path)
-        items_with_pdf = [i for i in items_with_pdf if i.key not in existing]
+        candidates = [i for i in candidates if i.key not in existing]
 
-    if not items_with_pdf:
-        return 0, n_skipped_no_pdf
+    if not candidates:
+        return 0, n_skipped
 
     conn = sqlite3.connect(db_path)
     now = datetime.now(timezone.utc).isoformat()
     n_embedded = 0
 
-    with tqdm(total=len(items_with_pdf), desc="Embedding full-text PDFs", unit="paper") as bar:
-        for item in items_with_pdf:
-            bar.set_postfix({"file": item.pdf_path.name[:40] if item.pdf_path else ""})
-            result = _embed_fulltext_single(item, max_tokens=max_tokens)
+    with tqdm(total=len(candidates), desc="Embedding full text", unit="item") as bar:
+        for item in candidates:
+            src = item.fulltext_path
+            bar.set_postfix({"item": (src.name if src else item.url)[:40]})
+            result = _embed_fulltext_single(item, max_tokens=max_tokens, fetch_missing=fetch_missing)
             if result is not None:
-                vec, n_tokens, n_chunks = result
+                vec, n_tokens, n_chunks, source = result
                 conn.execute(
                     """INSERT OR REPLACE INTO fulltext_embeddings
-                       (zotero_key, vector, embedded_at, n_tokens, n_chunks)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (item.key, vec.tobytes(), now, n_tokens, n_chunks),
+                       (zotero_key, vector, embedded_at, n_tokens, n_chunks, source)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (item.key, vec.tobytes(), now, n_tokens, n_chunks, source),
                 )
                 conn.commit()
                 n_embedded += 1
+            else:
+                n_skipped += 1
             bar.update(1)
 
     conn.close()
-    return n_embedded, n_skipped_no_pdf
+    return n_embedded, n_skipped

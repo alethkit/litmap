@@ -56,3 +56,18 @@ def test_sync_embeds_only_new_items(zotero_db, tmp_path):
     with patch("litmap.embedder._get_model") as mock_model:
         count2 = sync(db_path, zotero_db)
     assert count2 == 0
+
+
+def test_pick_device_honours_env_override(monkeypatch):
+    from litmap.embedder import pick_device
+    monkeypatch.setenv("LITMAP_DEVICE", "cpu")
+    assert pick_device() == "cpu"
+
+
+def test_pick_device_falls_back_to_cpu_without_mps(monkeypatch):
+    from litmap.embedder import pick_device
+    monkeypatch.delenv("LITMAP_DEVICE", raising=False)
+    import torch
+    monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert pick_device() == "cpu"

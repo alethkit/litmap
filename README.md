@@ -13,7 +13,7 @@ Everything runs locally — no background daemon, no network calls after the fir
 - **`litmap cluster`** — Hierarchical semantic clustering (≤2 levels) of a collection, bibliography, or the whole library. Outputs an interactive dendrogram (HTML), static dendrograms (PNG/PDF), a labelled outline (Markdown + JSON), and a `.linkage.npy` cache for downstream analyses.
 - **`litmap info`** — Show embedding status for a single paper.
 - **`litmap sync`** — Manually trigger title+abstract embedding of all Zotero items.
-- **`litmap sync-fulltext`** — Embed full PDF text for items with a local PDF. Vectors are stored separately and automatically preferred over title+abstract embeddings in all commands. Safe to interrupt and resume.
+- **`litmap sync-fulltext`** — Embed full text for items with a local PDF or HTML snapshot (web clips saved by the Zotero connector). With `--fetch-missing`, URL-only items are covered too: GitHub repository URLs yield their README, other URLs the visible text of the page. Vectors are stored separately and automatically preferred over title+abstract embeddings in all commands. Safe to interrupt and resume.
 - **Auto-sync** — Every command automatically embeds any Zotero items not yet in the cache before running. A `tqdm` progress bar appears during sync; silent if already up to date.
 - **Four map modes** — collection only, manuscript bibliography only, intersection, or full union.
 - **Manuscript node** — When `--manuscript` is provided, your paper appears as a red star in the map, positioned semantically among its cited works. Papers in the library that have the manuscript among their k nearest neighbours in embedding space will also draw edges to it, so the manuscript typically accumulates more edges than regular nodes.
@@ -37,7 +37,7 @@ uv venv
 uv pip install -e .
 ```
 
-On first use, `sentence-transformers` downloads the `Alibaba-NLP/gte-modernbert-base` embedding model (~570 MB). Subsequent runs are fully offline. On Apple Silicon, inference uses Metal (MPS) automatically.
+On first use, `sentence-transformers` downloads the `Alibaba-NLP/gte-modernbert-base` embedding model (~570 MB). Subsequent runs are fully offline. On Apple Silicon, inference uses Metal (MPS) automatically when it is available and falls back to CPU otherwise (MPS is often unavailable inside sandboxes and VMs). Set `LITMAP_DEVICE=cpu|mps|cuda` to override.
 
 ---
 
@@ -141,6 +141,8 @@ Options:
 
 Writes `<output>.html` (interactive dendrogram), `.pdf` + `.png` (static 300 DPI), `.md` + `.json` (labelled outline), and `.linkage.npy` (scipy linkage cache). If neither `--collection` nor `--manuscript` is given, the entire library is clustered. If both are given, `--union` is required.
 
+The hierarchy is built with Ward linkage on L2-normalised vectors by default (`--linkage ward`), which gives balanced, thematically coherent groups. `--linkage average` or `complete` use cosine distance directly; average linkage tends to peel off outliers (web clips, stubs) one by one and put every real paper in a single cluster, so use it only if you specifically want that behaviour.
+
 Level-1 cluster count defaults to `max(2, round(sqrt(N/2)))`; any level-1 cluster with at least `--subcluster-threshold` papers is split into sub-clusters. Cluster labels are TF-IDF keyword triplets derived from member title and abstract text.
 
 ### `litmap info <paper>`
@@ -171,7 +173,14 @@ Options:
       --force            Re-embed even already-processed PDFs
 ```
 
-Embeds the full text of every Zotero item that has a local PDF attachment. Text is extracted with PyMuPDF, split into non-overlapping chunks of `--max-tokens` tokens, and encoded one chunk at a time on MPS (to avoid GPU OOM on long documents). The chunk vectors are averaged and L2-normalised into a single 768-dimensional vector per paper. Vectors are stored in the `fulltext_embeddings` table and automatically preferred over title+abstract embeddings in `search`, `map`, and `cluster`. Papers without a local PDF fall back to title+abstract silently.
+Embeds the full text of every Zotero item that has a local full-text source. Sources are tried in order:
+
+1. **PDF attachment** — text extracted with PyMuPDF.
+2. **HTML snapshot** — the `text/html` file the Zotero connector saves for web pages and blog posts. Scripts, styles, navigation and footers are stripped; when the page has an `<article>` or `<main>` element only that region is used.
+3. **GitHub README** (only with `--fetch-missing`) — for items whose URL is a `github.com/<owner>/<repo>` repository, the README of the default branch is fetched via the GitHub API.
+4. **Web page at the item's URL** (only with `--fetch-missing`) — fetched and processed like a snapshot (PDF URLs are handled too).
+
+Without `--fetch-missing`, no network access happens. Extracted text shorter than ~40 words is treated as unusable and the item is skipped. Text is split into non-overlapping chunks of `--max-tokens` tokens and encoded one chunk at a time on MPS (to avoid GPU OOM on long documents). The chunk vectors are averaged and L2-normalised into a single 768-dimensional vector per paper. Vectors are stored in the `fulltext_embeddings` table (with the `source` that produced them: `pdf`, `html`, `github` or `url`) and automatically preferred over title+abstract embeddings in `search`, `map`, and `cluster`. Items without any usable source fall back to title+abstract silently.
 
 The job is safe to interrupt and resume — already-embedded papers are skipped unless `--force` is passed. Use `--collection` to scope the run to a single collection (works for both personal and group library collections), which is useful for testing higher token counts on a smaller set before committing to a full-library run.
 
@@ -181,6 +190,7 @@ litmap sync-fulltext --collection "My Papers" --max-tokens 6000
 
 # Re-embed a collection at 8000 tokens for richer semantic content
 litmap sync-fulltext --collection "My Papers" --max-tokens 8000 --force
+litmap sync-fulltext --collection "Web clips" --fetch-missing
 
 # Re-embed everything at a new token limit
 litmap sync-fulltext --max-tokens 3000 --force
@@ -207,7 +217,9 @@ Papers shorter than `--max-tokens` are encoded in full regardless of the setting
 Embeddings are stored in `~/LitLake/embeddings.db` (SQLite), created automatically on first run. The database holds two tables:
 
 - **`embeddings`** — title + abstract vectors. One row per Zotero item, ~3 KB each. Populated by `litmap sync` and auto-sync.
-- **`fulltext_embeddings`** — full-text vectors. One row per item with a local PDF, also ~3 KB each (the vector is always 768 float32 values regardless of how many chunks were averaged). Also stores `n_tokens` and `n_chunks` per paper, queryable via `litmap info` or directly with `sqlite3`.
+- **`fulltext_embeddings`** — full-text vectors. One row per item with a usable full-text source, also ~3 KB each (the vector is always 768 float32 values regardless of how many chunks were averaged). Also stores `n_tokens`, `n_chunks` and `source` (`pdf`, `html`, `github`, `url`) per item, queryable via `litmap info` or directly with `sqlite3`.
+
+Attachments, notes and annotations are never treated as papers (their item types are resolved by name at runtime, since Zotero renumbers item types between major versions), and items in Zotero's trash are excluded. Every sync removes cached vectors for keys that no longer correspond to a paper.
 
 All commands prefer full-text vectors when available and fall back to title+abstract per paper — the two tables can be populated independently and at different token limits.
 
