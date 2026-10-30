@@ -141,6 +141,8 @@ Options:
 
 Writes `<output>.html` (interactive dendrogram), `.pdf` + `.png` (static 300 DPI), `.md` + `.json` (labelled outline), and `.linkage.npy` (scipy linkage cache). If neither `--collection` nor `--manuscript` is given, the entire library is clustered. If both are given, `--union` is required.
 
+The hierarchy is built with Ward linkage on L2-normalised vectors by default (`--linkage ward`), which gives balanced, thematically coherent groups. `--linkage average` or `complete` use cosine distance directly; average linkage tends to peel off outliers (web clips, stubs) one by one and put every real paper in a single cluster, so use it only if you specifically want that behaviour.
+
 Level-1 cluster count defaults to `max(2, round(sqrt(N/2)))`; any level-1 cluster with at least `--subcluster-threshold` papers is split into sub-clusters. Cluster labels are TF-IDF keyword triplets derived from member title and abstract text.
 
 ### `litmap info <paper>`

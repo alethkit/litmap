@@ -673,3 +673,32 @@ def test_cluster_cmd_invalid_format_rejected(tmp_path, zotero_db, embeddings_db)
         ],
     )
     assert result.exit_code != 0
+
+
+def test_ward_does_not_peel_outliers_into_singletons():
+    """Three tight clusters plus two far outliers: Ward at k=3 must keep the
+    three real groups intact rather than spending clusters on the outliers
+    (the failure mode seen with average linkage on real libraries)."""
+    import numpy as np
+    from collections import Counter
+    from litmap.cluster import compute_hierarchy, cut_levels
+
+    rng = np.random.default_rng(0)
+    centers = rng.normal(size=(3, 768))
+    rows = [c + 0.05 * rng.normal(size=768) for c in centers for _ in range(8)]
+    rows += [rng.normal(size=768) * 5, -rng.normal(size=768) * 5]   # two outliers
+    M = np.stack(rows).astype(np.float32)
+    keys = [f"K{i:02d}" for i in range(len(rows))]
+
+    ward = cut_levels(compute_hierarchy(M, "ward"), keys, M, top_k=3, subcluster_threshold=999, method="ward")
+    sizes = sorted(Counter(a["cluster_id"] for a in ward).values(), reverse=True)
+    assert sizes[0] <= 10 and len(sizes) == 3, sizes          # no mega-cluster
+    assert min(sizes) >= 8, sizes                              # no singleton cluster
+
+
+def test_compute_hierarchy_rejects_unknown_method():
+    import numpy as np
+    import pytest
+    from litmap.cluster import compute_hierarchy
+    with pytest.raises(ValueError):
+        compute_hierarchy(np.ones((3, 4), dtype=np.float32), method="single")

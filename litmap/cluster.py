@@ -28,18 +28,34 @@ def _read_pdf_text(item: Item) -> str:
         return ""
 
 
-def compute_hierarchy(matrix: np.ndarray) -> np.ndarray:
+LINKAGE_METHODS = ("ward", "average", "complete")
+DEFAULT_LINKAGE = "ward"
+
+
+def compute_hierarchy(matrix: np.ndarray, method: str = DEFAULT_LINKAGE) -> np.ndarray:
     """Return a scipy linkage matrix from an N×D embedding matrix.
 
-    Uses cosine distance and average linkage — consistent with the cosine
-    similarity used elsewhere in litmap, and compatible with non-Euclidean
-    metrics (unlike Ward linkage).
+    method="ward" (default) minimises within-cluster variance and yields
+    balanced, interpretable groups. Ward requires Euclidean distances, so
+    rows are L2-normalised first: on unit vectors, squared Euclidean distance
+    is 2·(1 − cosine similarity), i.e. the same geometry litmap uses elsewhere.
+
+    method="average" / "complete" use cosine distance directly. Average
+    linkage is prone to peeling off outliers (web clips, stubs) one at a time
+    and lumping everything else into a single cluster, which is why it is no
+    longer the default.
 
     Shape of the returned array: (N-1, 4).
     """
     if matrix.shape[0] < 2:
         raise ValueError("compute_hierarchy requires at least 2 rows")
-    return linkage(matrix, method="average", metric="cosine")
+    if method not in LINKAGE_METHODS:
+        raise ValueError(f"method must be one of {LINKAGE_METHODS}, got {method!r}")
+    if method == "ward":
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return linkage(matrix / norms, method="ward", metric="euclidean")
+    return linkage(matrix, method=method, metric="cosine")
 
 
 def cut_levels(
@@ -48,6 +64,7 @@ def cut_levels(
     matrix: np.ndarray,
     top_k: int,
     subcluster_threshold: int,
+    method: str = DEFAULT_LINKAGE,
 ) -> list[dict]:
     """Return [{key, cluster_id, subcluster_id|None}, ...] in input order.
 
@@ -73,7 +90,7 @@ def cut_levels(
         if size < subcluster_threshold:
             continue
         sub_matrix = matrix[idxs]
-        sub_linkage = compute_hierarchy(sub_matrix)
+        sub_linkage = compute_hierarchy(sub_matrix, method=method)
         n_sub = max(2, round((size / 2) ** 0.5))
         sub_labels = fcluster(sub_linkage, t=n_sub, criterion="maxclust")
         for local_i, idx in enumerate(idxs):

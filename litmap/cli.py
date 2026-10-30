@@ -328,6 +328,7 @@ def cluster_cmd(
     union: bool = typer.Option(False, "--union", help="Use collection ∪ bibliography as paper set"),
     top_clusters: Optional[int] = typer.Option(None, "--top-clusters", help="Number of level-1 clusters"),
     subcluster_threshold: int = typer.Option(20, "--subcluster-threshold", help="Min cluster size that triggers level-2"),
+    linkage_method: str = typer.Option("ward", "--linkage", help="ward (balanced groups, default) | average | complete"),
     output: Path = typer.Option(Path("litmap_cluster"), "--output", "-o", help="Output base path"),
     fmt: str = typer.Option("all", "--format", "-f", help="html | pdf | png | md | json | all"),
     db_path: Path = typer.Option(_DEFAULT_DB, hidden=True),
@@ -337,6 +338,10 @@ def cluster_cmd(
     VALID_FORMATS = {"html", "pdf", "png", "md", "json", "all"}
     if fmt not in VALID_FORMATS:
         typer.echo(f"Error: --format must be one of {sorted(VALID_FORMATS)}", err=True)
+        raise typer.Exit(1)
+    from litmap.cluster import LINKAGE_METHODS
+    if linkage_method not in LINKAGE_METHODS:
+        typer.echo(f"Error: --linkage must be one of {list(LINKAGE_METHODS)}", err=True)
         raise typer.Exit(1)
 
     from litmap.zotero import get_collection, get_all_items, get_subcollection_map
@@ -397,8 +402,8 @@ def cluster_cmd(
     top_k = top_clusters if top_clusters is not None else max(2, round((n / 2) ** 0.5))
     top_k = min(top_k, n)
 
-    linkage = compute_hierarchy(matrix)
-    assignments = cut_levels(linkage, keys, matrix, top_k, subcluster_threshold)
+    linkage = compute_hierarchy(matrix, method=linkage_method)
+    assignments = cut_levels(linkage, keys, matrix, top_k, subcluster_threshold, method=linkage_method)
     cluster_labels = label_clusters(items, assignments, level="cluster")
     subcluster_labels = label_clusters(items, assignments, level="subcluster")
     subcols = get_subcollection_map(zotero_db)
@@ -415,7 +420,7 @@ def cluster_cmd(
             "union": union,
             "n_papers": n,
         },
-        params={"top_clusters": top_k, "subcluster_threshold": subcluster_threshold},
+        params={"top_clusters": top_k, "subcluster_threshold": subcluster_threshold, "linkage": linkage_method},
     )
 
     want = {"html", "pdf", "png", "md", "json"} if fmt == "all" else {fmt}
